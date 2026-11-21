@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Video Frame Viewer",
+    "description": "Open a local MP4 from the sidebar, play at normal/slow/fast speed, step through frames, and click a thumbnail to jump to that frame."
+  }
+}

@@ -1,0 +1,15 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# 日志与临时文件
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# 测试运行产物（每次 E2E 会覆盖，不入库）
+test/screenshots/

@@ -1,0 +1,7 @@
+# 视频逐帧查看 —— 纯客户端插件。
+#
+# Host 半边只插入一个空壳，用来把客户端包登记进 profile；
+# 播放、解码与帧索引全部在浏览器里完成，Host 不需要任何服务。
+- insert:
+    - id: video-frame-viewer
+      name: '@local/dsh-video-frame-viewer'
