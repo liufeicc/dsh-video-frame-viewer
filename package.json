@@ -22,6 +22,8 @@
     "client.view.js",
     "client.window.js",
     "client.strip.js",
+    "client.sheet.js",
+    "client.copy.js",
     "client.styles.js",
     "client.dicts.js",
     "cordis.patch.yml",

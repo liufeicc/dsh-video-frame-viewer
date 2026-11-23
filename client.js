@@ -16,7 +16,9 @@
  *   - client.icons.js     SVG 图标；
  *   - client.view.js      React 视图（查看面板本体）；
  *   - client.window.js    浮动窗口外壳（拖动、缩放、最大化）；
- *   - client.strip.js     帧胶片（每秒一张，双击展开该秒全部帧）。
+ *   - client.strip.js     帧胶片（每秒一张，双击展开该秒全部帧，支持多选）；
+ *   - client.sheet.js     抓帧池与拼图（复制多帧时按时间顺序拼成一张大图）；
+ *   - client.copy.js      复制状态机与播放控制条右侧的复制按钮。
  *
  * 入口只负责装载、注册插槽和注入样式，不承载业务逻辑。
  */
@@ -41,6 +43,8 @@ window.__ModuleLoader__.load({
       './client.view.js',
       './client.window.js',
       './client.strip.js',
+      './client.sheet.js',
+      './client.copy.js',
     ];
 
     /**
@@ -53,7 +57,7 @@ window.__ModuleLoader__.load({
         return Promise.reject(new Error('client module loader 不支持包内代码块（require.async 缺失）'));
       }
       return Promise.all(CHUNK_FILES.map((file) => require.async(file)))
-        .then(([styles, dicts, mp4, playback, icons, view, window, strip]) => ({
+        .then(([styles, dicts, mp4, playback, icons, view, window, strip, sheet, copy]) => ({
           styles,
           dicts,
           mp4,
@@ -62,6 +66,8 @@ window.__ModuleLoader__.load({
           view,
           window,
           strip,
+          sheet,
+          copy,
         }));
     }
 
@@ -132,6 +138,8 @@ window.__ModuleLoader__.load({
         helpers: mods.playback,
         icons: mods.icons,
         strip: mods.strip,
+        sheet: mods.sheet,
+        copy: mods.copy,
       });
       const floating = mods.window.createWindow({
         css: mods.styles.css,

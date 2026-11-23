@@ -77,42 +77,73 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 把 <video> 定位到指定时间，并等画面真正更新。
+     * 把 <video> 定位到指定时间，并等目标帧真正解码出来。
+     *
+     * 为什么要等 loadeddata、还要再等 rVFC：
+     *   - 大视频打开后可能只有元数据（readyState 1），此时直接 seek 会先返回
+     *     旧画面；
+     *   - 长 GOP 的视频（例如关键帧间隔 4 秒）seek 到目标帧需要从关键帧解码
+     *     上百帧，1 秒超时远远不够。超时后若把旧画面当目标帧，缩略图就会缓存
+     *     错帧，看起来就是「选中的帧和视频画面不一致」。
+     *
+     * 所以：等可绘制数据 → seek → 等 seeked → 等 rVFC 确认新帧已呈现。
+     * 超时返回 false，调用方据此丢弃这一帧，而不是拿旧画面凑数。
+     *
      * @param {HTMLVideoElement} video - 视频元素。
      * @param {number} target - 目标时间（秒）。
-     * @returns {Promise<void>} 画面更新后完成；超时也会完成，避免界面卡死。
+     * @param {number} timeoutMs - 最长等待时间；长 GOP 视频需要留足。
+     * @returns {Promise<boolean>} 目标帧是否已经可用。
      */
-    function seekToTime(video, target) {
+    async function seekToTime(video, target, timeoutMs = 5000) {
+      if (!video) return false;
+      const ready = await ensureVideoData(video, timeoutMs);
+      if (!ready) return false;
+      const max = Number.isFinite(video.duration) ? Math.max(0, video.duration - 0.0005) : target;
+      const time = Math.max(0, Math.min(target, max));
+      if (Math.abs(video.currentTime - time) < 0.0002) {
+        await nextPaint();
+        return true;
+      }
       return new Promise((resolve) => {
-        if (!video || video.readyState < 1) {
-          resolve();
-          return;
-        }
-        const max = Number.isFinite(video.duration) ? Math.max(0, video.duration - 0.0005) : target;
-        const time = Math.max(0, Math.min(target, max));
         let settled = false;
         let timer = null;
-        const onSeeked = () => {
-          video.removeEventListener('seeked', onSeeked);
-          nextPaint().then(finish);
-        };
-        function finish() {
+        let frameTimer = null;
+        let frameCallback = null;
+        function finish(ok) {
           if (settled) return;
           settled = true;
           if (timer !== null) clearTimeout(timer);
+          if (frameTimer !== null) clearTimeout(frameTimer);
+          if (frameCallback !== null && typeof video.cancelVideoFrameCallback === 'function') {
+            try {
+              video.cancelVideoFrameCallback(frameCallback);
+            } catch {
+              /* 已经触发的回调取消失败没有影响。 */
+            }
+          }
           video.removeEventListener('seeked', onSeeked);
-          resolve();
+          resolve(ok);
         }
-        if (Math.abs(video.currentTime - time) < 0.0002) {
-          nextPaint().then(finish);
-          return;
+        function onSeeked() {
+          video.removeEventListener('seeked', onSeeked);
+          /*
+           * seeked 只代表 seek 操作结束；画面是否已经换成目标帧，用 rVFC 确认。
+           * 有些浏览器在暂停 seek 后不会触发 rVFC，留一个 700ms 的兜底，
+           * 但仍以 seeked 为「可用」信号（此时新帧通常已经画上）。
+           */
+          if (typeof video.requestVideoFrameCallback === 'function') {
+            frameCallback = video.requestVideoFrameCallback(() => finish(true));
+            frameTimer = setTimeout(() => finish(true), 180);
+          } else {
+            nextPaint().then(() => finish(true));
+          }
         }
-        video.addEventListener('seeked', onSeeked);
-        timer = setTimeout(finish, 1000);
+        video.addEventListener('seeked', onSeeked, { once: true });
+        timer = setTimeout(() => finish(false), timeoutMs);
         try {
           video.currentTime = time;
         } catch {
-          finish();
+          finish(false);
         }
       });
     }

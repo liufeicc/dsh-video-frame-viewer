@@ -175,6 +175,42 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 读编辑列表（elst）的媒体起点。
+     *
+     * MP4 的编辑列表可以跳过媒体开头的若干采样（例如录屏把启动黑屏剪掉）。
+     * 浏览器播放时会应用它：时间 0 对应媒体时间 `media_time`，而不是 0。
+     * 不处理它，逐帧时间轴会整体偏移，帧号和画面就对不上。
+     *
+     * 这里只取第一个非空 edit 的 media_time，并且假设它是一段连续编辑；
+     * 多段拼接/变速的编辑列表在本地视频里很少见，遇到时仍能播，只是
+     * 帧号与画面对齐可能按第一段计算。
+     *
+     * @param {DataView} view - 缓冲区视图。
+     * @param {object} box - elst 盒子。
+     * @returns {number|null} media_time（媒体时间单位）；没有可用 edit 时 null。
+     */
+    function parseElstOffset(view, box) {
+      const version = view.getUint8(box.dataStart);
+      const count = view.getUint32(box.dataStart + 4);
+      let cursor = box.dataStart + 8;
+      for (let index = 0; index < count; index += 1) {
+        let mediaTime;
+        if (version === 1) {
+          if (cursor + 20 > box.end) break;
+          mediaTime = Number(view.getBigInt64(cursor + 8));
+          cursor += 20;
+        } else {
+          if (cursor + 12 > box.end) break;
+          mediaTime = view.getInt32(cursor + 4);
+          cursor += 12;
+        }
+        // media_time = -1 是空编辑（blank），跳过它继续找真正有媒体的那一段。
+        if (mediaTime !== -1) return mediaTime;
+      }
+      return null;
+    }
+
+    /**
      * 读 stts（time-to-sample）：每个 sample 的持续时间。
      * @param {DataView} view - 缓冲区视图。
      * @param {object} box - stts 盒子。
@@ -305,6 +341,9 @@ window.__ModuleLoader__.load({
         const hdlr = childOf(view, mdia, 'hdlr');
         if (hdlr === undefined || hdlr.dataStart + 12 > hdlr.end) continue;
         if (fourcc(view, hdlr.dataStart + 8) !== 'vide') continue;
+        const edts = childOf(view, trak, 'edts');
+        const elst = edts === undefined ? undefined : childOf(view, edts, 'elst');
+        const editOffset = elst === undefined ? null : parseElstOffset(view, elst);
         const mdhd = childOf(view, mdia, 'mdhd');
         const minf = childOf(view, mdia, 'minf');
         const stbl = minf === undefined ? undefined : childOf(view, minf, 'stbl');
@@ -353,25 +392,37 @@ window.__ModuleLoader__.load({
           }
         }
         if (unique === 0) throw new Error('no frames');
-        const base = merged[0];
-        const times = new Float64Array(unique);
+        /*
+         * 编辑列表的 media_time 是媒体时间轴的起点：浏览器把「时间 0」映射到
+         * 这个媒体时间，更早的采样被跳过。没有编辑列表时，退回「首帧归一化」。
+         *
+         * 这个偏移必须应用，否则帧号会整体偏（例如录屏视频的 elst 跳过 2 帧，
+         * 点第 482 帧时播放器实际显示的是第 484 帧的画面）。
+         */
+        const base = editOffset === null ? merged[0] : editOffset;
+        const kept = [];
         for (let index = 0; index < unique; index += 1) {
-          times[index] = (merged[index] - base) / meta.timescale;
+          let value = (merged[index] - base) / meta.timescale;
+          if (value < -1e-9) continue;
+          if (value < 0) value = 0;
+          kept.push(value);
         }
-        const duration = dts.length === 0
-          ? 0
-          : (dts[dts.length - 1] + samples.entries[samples.entries.length - 1][1]) / meta.timescale;
+        if (kept.length === 0) throw new Error('no frames after edit list');
+        const times = Float64Array.from(kept);
+        const lastDelta = samples.entries[samples.entries.length - 1][1] / meta.timescale;
+        const duration = times[times.length - 1] + lastDelta;
 
         return {
           ok: true,
           exact: true,
           times,
-          frameCount: unique,
+          frameCount: times.length,
           fps,
           fpsLabel: variable ? 'VFR' : fpsText(fps),
           variable,
           duration,
           timescale: meta.timescale,
+          editOffset,
           source: 'moov',
         };
       }

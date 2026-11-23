@@ -179,6 +179,7 @@ await send('Page.addScriptToEvaluateOnNewDocument', {
                 for (const type of types) {
                   const blob = await item.getType(type);
                   blobs[type] = { size: blob.size, type: blob.type };
+                  if (type === 'image/png') window.__vfvLastBlob = blob;
                 }
                 record.push({ types, blobs });
               }
@@ -467,6 +468,148 @@ check(afterThumb.paused === true, '单击缩略帧后视频暂停');
 check(afterThumb.time > 0.13 && afterThumb.time < 0.14, '跳到第 5 帧（0.133s）', afterThumb.time);
 check(afterThumb.frameText === '5', '帧号显示为 5', afterThumb.frameText);
 check(afterThumb.thumbs > 0, '帧胶片已生成缩略图', afterThumb.thumbs);
+
+// 6.5) 逐帧视图多选：Shift 连选、Ctrl 多选，复制成拼图
+const clickFrameExpression = (frame, modifiers) => `(() => {
+  const button = document.querySelector('button[aria-label^="第 ${frame} 帧"]');
+  if (button === null) return false;
+  button.dispatchEvent(new MouseEvent('click', {
+    bubbles: true,
+    cancelable: true,
+    view: window${modifiers && modifiers.shift ? ', shiftKey: true' : ''}${modifiers && modifiers.ctrl ? ', ctrlKey: true' : ''},
+  }));
+  return true;
+})()`;
+
+const shiftClicked = await evaluate(clickFrameExpression(10, { shift: true }), sessionId);
+check(shiftClicked === true, 'Shift+单击第 10 帧');
+await sleep(500);
+const shiftState = await evaluate(`
+  (() => {
+    const copy = document.querySelector('[data-copy-frame="true"]');
+    return {
+      selected: document.querySelectorAll('.dshVfv_thumbSelected').length,
+      checks: document.querySelectorAll('.dshVfv_thumbCheck').length,
+      label: copy ? copy.getAttribute('aria-label') : '',
+      selectedText: [...document.querySelectorAll('.dshVfv_stripSelectedCount')].map((node) => node.textContent),
+    };
+  })()
+`, sessionId);
+check(shiftState.selected === 6, 'Shift 连选第 5–10 帧共 6 帧', shiftState);
+check(shiftState.checks === 6, '6 张缩略图显示选中勾', shiftState.checks);
+check(shiftState.label === '复制选中的 6 帧', '复制按钮显示选中数量', shiftState.label);
+check(shiftState.selectedText.includes('已选 6 帧'), '胶片旁显示「已选 6 帧」', shiftState.selectedText);
+const multiShot = await send('Page.captureScreenshot', { format: 'png' }, sessionId);
+await writeFile(SHOT_DIR + 'e2e-multiselect.png', Buffer.from(multiShot.data, 'base64'));
+console.log('截图:', SHOT_DIR + 'e2e-multiselect.png');
+
+const ctrlClicked = await evaluate(clickFrameExpression(12, { ctrl: true }), sessionId);
+check(ctrlClicked === true, 'Ctrl+单击第 12 帧');
+await sleep(500);
+const ctrlState = await evaluate(`
+  (() => {
+    const copy = document.querySelector('[data-copy-frame="true"]');
+    return {
+      selected: document.querySelectorAll('.dshVfv_thumbSelected').length,
+      label: copy ? copy.getAttribute('aria-label') : '',
+    };
+  })()
+`, sessionId);
+check(ctrlState.selected === 7, 'Ctrl 加入第 12 帧后共 7 帧', ctrlState);
+check(ctrlState.label === '复制选中的 7 帧', '复制按钮更新为 7 帧', ctrlState.label);
+
+const ctrlRemove = await evaluate(clickFrameExpression(12, { ctrl: true }), sessionId);
+check(ctrlRemove === true, 'Ctrl+再次单击第 12 帧取消选择');
+await sleep(500);
+const ctrlRemoveState = await evaluate(`
+  (() => {
+    const copy = document.querySelector('[data-copy-frame="true"]');
+    return {
+      selected: document.querySelectorAll('.dshVfv_thumbSelected').length,
+      label: copy ? copy.getAttribute('aria-label') : '',
+    };
+  })()
+`, sessionId);
+check(ctrlRemoveState.selected === 6, 'Ctrl 取消后回到 6 帧', ctrlRemoveState);
+check(ctrlRemoveState.label === '复制选中的 6 帧', '复制按钮回到 6 帧', ctrlRemoveState.label);
+
+const callsBeforeSheet = await evaluate(`window.__vfvClipboard.length`, sessionId);
+const sheetCopyClicked = await evaluate(`
+  (() => {
+    const button = document.querySelector('[data-copy-frame="true"]');
+    if (button === null) return false;
+    button.click();
+    return true;
+  })()
+`, sessionId);
+check(sheetCopyClicked === true, '点击复制 6 帧');
+await sleep(1200);
+const sheetResult = await evaluate(`
+  (async () => {
+    const calls = window.__vfvClipboard;
+    const blob = window.__vfvLastBlob;
+    let size = null;
+    if (blob instanceof Blob) {
+      const bitmap = await createImageBitmap(blob);
+      size = { width: bitmap.width, height: bitmap.height };
+      bitmap.close();
+    }
+    const copy = document.querySelector('[data-copy-frame="true"]');
+    const last = calls[calls.length - 1];
+    return {
+      calls: calls.length,
+      types: last ? last[0].types : [],
+      pngSize: last ? last[0].blobs['image/png']?.size ?? -1 : -1,
+      size,
+      className: copy ? copy.className : '',
+      label: copy ? copy.getAttribute('aria-label') : '',
+    };
+  })()
+`, sessionId);
+check(sheetResult.calls === callsBeforeSheet + 1, '多选复制调用了一次剪贴板写入', sheetResult.calls);
+check(sheetResult.types.includes('image/png'), '拼接图是 image/png', sheetResult.types);
+check(sheetResult.pngSize > 5000, '拼接图有实际内容', sheetResult.pngSize);
+check(sheetResult.size !== null && sheetResult.size.width > 600 && sheetResult.size.height > 500, '拼接图尺寸合理', sheetResult.size);
+check(/dshVfv_iconButtonDone/.test(sheetResult.className), '拼接复制成功后按钮显示成功状态');
+check(sheetResult.label === '已复制选中的 6 帧', '拼接复制后按钮文案显示已复制 6 帧', sheetResult.label);
+const sheetBase64 = await evaluate(`
+  (async () => {
+    const blob = window.__vfvLastBlob;
+    if (!(blob instanceof Blob)) return null;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
+    return btoa(binary);
+  })()
+`, sessionId);
+if (sheetBase64 !== null) {
+  await writeFile(SHOT_DIR + 'e2e-contact-sheet.png', Buffer.from(sheetBase64, 'base64'));
+  console.log('截图:', SHOT_DIR + 'e2e-contact-sheet.png');
+}
+
+await waitFor(`(() => {
+  const button = document.querySelector('[data-copy-frame="true"]');
+  return button !== null && !/已复制|Copied/.test(button.getAttribute('aria-label') || '');
+})()`, sessionId, 6000, '复制状态复位');
+const resetClicked = await evaluate(clickFrameExpression(3, {}), sessionId);
+check(resetClicked === true, '普通单击第 3 帧');
+await sleep(400);
+const resetState = await evaluate(`
+  (() => {
+    const copy = document.querySelector('[data-copy-frame="true"]');
+    return {
+      selected: document.querySelectorAll('.dshVfv_thumbSelected').length,
+      label: copy ? copy.getAttribute('aria-label') : '',
+    };
+  })()
+`, sessionId);
+check(resetState.selected === 1, '普通单击把选择重置为 1 帧', resetState);
+check(resetState.label === '复制当前帧', '普通单击后复制按钮回到「复制当前帧」', resetState.label);
+
+// 恢复到第 5 帧，保持后续「上一帧」测试的断言不变
+const restoreClicked = await evaluate(clickFrameExpression(5, {}), sessionId);
+check(restoreClicked === true, '恢复到第 5 帧');
+await sleep(350);
 
 const backClicked = await evaluate(`
   (() => {

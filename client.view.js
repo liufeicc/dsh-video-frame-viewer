@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
   id: '@local/dsh-video-frame-viewer/client.view.js',
   factory(require) {
     const React = require('react');
-    const { useCallback, useEffect, useRef, useState } = React;
+    const { useCallback, useEffect, useMemo, useRef, useState } = React;
     const h = React.createElement;
 
     /** 速度快捷档位；滑杆可以在 0.1–4 之间细调。 */
@@ -20,14 +20,16 @@ window.__ModuleLoader__.load({
 
     /**
      * 组装视图组件。
-     * @param {{css: object, mp4: object, helpers: object, icons: object, strip: object}} deps -
-     *   样式表、MP4 解析 API、播放辅助函数、图标组件与帧胶片块。
+     * @param {{css: object, mp4: object, helpers: object, icons: object,
+     *   strip: object, sheet: object, copy: object}} deps -
+     *   样式表、MP4 解析 API、播放辅助函数、图标组件、帧胶片块、抓帧/拼图块与复制控件。
      * @returns {{ViewerPanel: Function}} 查看面板本体（整页与浮窗共用）。
      */
-    function createView({ css, mp4, helpers, icons, strip }) {
+    function createView({ css, mp4, helpers, icons, strip, sheet, copy }) {
       const { formatTime, formatBytes, seekToTime, probeFrameRate } = helpers;
-      const { FilmPlayIcon, FolderIcon, AlertIcon, PlayGlyph, PauseGlyph, FrameGlyph, CopyGlyph, CheckGlyph } = icons;
+      const { FilmPlayIcon, FolderIcon, AlertIcon, PlayGlyph, PauseGlyph, FrameGlyph } = icons;
       const { Filmstrip } = strip.createFilmstrip({ css, helpers });
+      const { useFrameCopy, FrameCopyButton } = copy;
 
       /*
        * 面板切换会把整页组件卸载（main 槽位只渲染当前面板）。把「当前视频 + 停在哪一帧」
@@ -58,14 +60,32 @@ window.__ModuleLoader__.load({
         const [error, setError] = useState(null);
         const [dropActive, setDropActive] = useState(false);
         /**
-         * 复制当前帧的状态：
-         *   idle（可复制）→ busy（正在写剪贴板）→ done / failed / unsupported → 1.8 秒后回 idle。
+         * 逐帧视图里选中的帧号（升序，由帧胶片组件报告）。
+         * 超过 1 帧时复制按钮改为「拼接成一张图」。
          */
-        const [copyStatus, setCopyStatus] = useState('idle');
+        const [selectedFrames, setSelectedFrames] = useState([]);
+        /**
+         * 抓帧器与它的隐藏 video 池：缩略图和拼图复制共用。
+         * 池元素由下面的 JSX 渲染，ref 回调把节点交给 grabber。
+         */
+        const grabber = useMemo(() => sheet.createFrameGrabber({ helpers }), [sheet, helpers]);
+        const grabberSetters = useMemo(
+          () => Array.from({ length: grabber.workerCount }, (_, index) => (node) => {
+            grabber.attach(index, node);
+          }),
+          [grabber],
+        );
 
         const fileInputRef = useRef(null);
         const videoRef = useRef(null);
         const timelineRef = useRef(null);
+        const { copyStatus, copyFrame } = useFrameCopy({
+          grabber,
+          sheet,
+          videoRef,
+          timelineRef,
+          selectedFrames,
+        });
         const frameRef = useRef(0);
         const speedRef = useRef(session.speed);
         const sourceRef = useRef(session.source);
@@ -166,12 +186,32 @@ window.__ModuleLoader__.load({
           if (!video.paused) video.pause();
           const frameTime = active.times[index];
           if (!Number.isFinite(frameTime)) return;
-          await seekToTime(video, frameTime + 0.0004);
+          let seeked = await seekToTime(video, frameTime + 0.0004);
           if (seekSeqRef.current !== sequence) return;
+          /*
+           * 长 GOP / 大视频第一次 seek 可能超时（还在解码）。重试一次，
+           * 仍然失败就保留旧画面并记录日志，不假装已经跳到了目标帧。
+           */
+          if (!seeked) {
+            seeked = await seekToTime(video, frameTime + 0.0004);
+            if (seekSeqRef.current !== sequence) return;
+          }
+          if (!seeked) {
+            console.warn('[video-frame-viewer] seek 未在超时内完成，画面可能仍是上一帧');
+            return;
+          }
           positionRef.current = video.currentTime;
           setCurrentTime(video.currentTime);
           setFrameIndex(index);
         }, []);
+
+        /**
+         * 帧胶片点击的回调。必须保持引用稳定：Filmstrip 里的 Thumb 用 React.memo
+         * 做了浅比较，如果每次渲染都传新函数，所有缩略图都会重新渲染。
+         */
+        const handleFilmstripSelect = useCallback((frame) => {
+          void goToFrame(frame);
+        }, [goToFrame]);
 
         /** 前后翻帧；播放中会先暂停。 */
         const stepFrames = useCallback((delta) => {
@@ -194,53 +234,6 @@ window.__ModuleLoader__.load({
           }
         }, [t]);
 
-        /**
-         * 复制当前画面到系统剪贴板。
-         *
-         * 流程：主 <video> 当前显示帧 → 原始分辨率的 canvas → PNG Blob →
-         * `navigator.clipboard.write([ClipboardItem])`。本地 blob URL 不会污染
-         * canvas，所以 `toBlob` 不会抛 SecurityError。
-         *
-         * 播放中不复制（按钮也会禁用）：播放时画面一直在变，复制到的帧不确定，
-         * 而且剪辑软件等接收方会拿到一张模糊的中间帧。剪贴板 API 不可用
-         * （非安全上下文/浏览器不支持）时给出明确的失败反馈，而不是静默。
-         */
-        const copyFrame = useCallback(async () => {
-          const video = videoRef.current;
-          if (video === null || !video.paused || video.videoWidth === 0 || video.videoHeight === 0) return;
-          const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
-          if (typeof ClipboardItem === 'undefined' || clipboard === undefined || typeof clipboard.write !== 'function') {
-            setCopyStatus('unsupported');
-            return;
-          }
-          setCopyStatus('busy');
-          try {
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const context = canvas.getContext('2d');
-            if (context === null) throw new Error('canvas 2d context unavailable');
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const blob = await new Promise((resolve, reject) => {
-              canvas.toBlob((value) => {
-                if (value === null) reject(new Error('canvas.toBlob returned null'));
-                else resolve(value);
-              }, 'image/png');
-            });
-            await clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-            setCopyStatus('done');
-          } catch (reason) {
-            console.warn('[video-frame-viewer] 复制当前帧失败：', reason);
-            setCopyStatus('failed');
-          }
-        }, []);
-
-        /** done / failed / unsupported 都是短暂反馈，1.8 秒后回到 idle。 */
-        useEffect(() => {
-          if (copyStatus === 'idle' || copyStatus === 'busy') return undefined;
-          const timer = setTimeout(() => setCopyStatus('idle'), 1800);
-          return () => clearTimeout(timer);
-        }, [copyStatus]);
 
         /** 设置倍速，范围 0.1–4，保留两位小数。 */
         const applySpeed = useCallback((next) => {
@@ -283,6 +276,7 @@ window.__ModuleLoader__.load({
           setPlaying(false);
           setError(null);
           probeStartedRef.current = false;
+          setSelectedFrames([]);
         }, [t, applySpeed]);
 
         /** 关闭当前视频，回到空状态。 */
@@ -305,6 +299,7 @@ window.__ModuleLoader__.load({
           setPlaying(false);
           setError(null);
           probeStartedRef.current = false;
+          setSelectedFrames([]);
         }, []);
 
         /** 打开新的元数据：记录分辨率/时长，若精确索引还没到就先铺一条兜底时间轴。 */
@@ -405,7 +400,7 @@ window.__ModuleLoader__.load({
         /** 播放中用 100ms 的节拍刷新画面时间；视频本身的播放是独立的。 */
         useEffect(() => {
           if (!playing) return undefined;
-          const timer = setInterval(syncFromVideo, 100);
+          const timer = setInterval(syncFromVideo, 250);
           return () => clearInterval(timer);
         }, [playing, syncFromVideo]);
 
@@ -462,8 +457,8 @@ window.__ModuleLoader__.load({
             : parseState === 'failed'
               ? t('status.probing')
               : parseState === 'parsing'
-                ? t('status.parsing')
-                : '';
+                  ? t('status.parsing')
+                  : '';
         const statusDot = parseState === 'exact'
           ? css.statusDot + ' ' + css.statusDotOk
           : parseState === 'parsing' || parseState === 'failed'
@@ -642,36 +637,16 @@ window.__ModuleLoader__.load({
                       }, playing ? h(PauseGlyph) : h(PlayGlyph), playing ? t('controls.pause') : t('controls.play')),
                       iconButton(t('controls.next'), h(FrameGlyph, { direction: 'next' }), () => stepFrames(1), !canStep),
                       iconButton(t('controls.last'), h(FrameGlyph, { direction: 'last' }), () => { void goToFrame(frameCount - 1); }, !canStep),
-                      h('button', {
-                        type: 'button',
-                        'data-copy-frame': 'true',
-                        className: css.iconButton
-                          + (copyStatus === 'done' ? ' ' + css.iconButtonDone : '')
-                          + (copyStatus === 'failed' || copyStatus === 'unsupported' ? ' ' + css.iconButtonFailed : ''),
-                        title: copyStatus === 'done'
-                          ? t('controls.copied')
-                          : copyStatus === 'failed'
-                            ? t('controls.copyFailed')
-                            : copyStatus === 'unsupported'
-                              ? t('controls.copyUnsupported')
-                              : playing
-                                ? t('controls.copyWhilePlaying')
-                                : t('controls.copyFrame'),
-                        'aria-label': copyStatus === 'done'
-                          ? t('controls.copied')
-                          : copyStatus === 'failed'
-                            ? t('controls.copyFailed')
-                            : copyStatus === 'unsupported'
-                              ? t('controls.copyUnsupported')
-                              : t('controls.copyFrame'),
+                      h(FrameCopyButton, {
+                        t,
+                        css,
+                        icons,
+                        copyStatus,
+                        playing,
+                        selectedCount: selectedFrames.length,
                         onClick: () => { void copyFrame(); },
-                        disabled: playing || copyStatus === 'busy',
-                      },
-                        copyStatus === 'done'
-                          ? h(CheckGlyph)
-                          : copyStatus === 'failed' || copyStatus === 'unsupported'
-                            ? h(AlertIcon)
-                            : h(CopyGlyph))),
+                      }),
+                    ),
                     h('div', { className: css.timecode },
                       h('span', { className: css.timecodeStrong }, String(frameIndex + 1)),
                       h('span', null, `/ ${frameCount === 0 ? '—' : frameCount}`),
@@ -717,10 +692,28 @@ window.__ModuleLoader__.load({
                     timeline,
                     frameIndex,
                     playing,
-                    onSelectFrame: (frame) => { void goToFrame(frame); },
+                    grabber,
+                    onSelectFrame: handleFilmstripSelect,
+                    onSelectionChange: setSelectedFrames,
                   }),
 
                   h('div', { className: css.hints }, t('hints.keyboard')))),
+
+          /*
+           * 抓帧池：3 个不可见的 video 元素，缩略图与拼图复制共用。
+           * 它们只负责解码与绘制，不出现在布局里。
+           */
+          source === null ? null : Array.from({ length: grabber.workerCount }, (_, index) => h('video', {
+            key: 'grabber-video-' + index,
+            ref: grabberSetters[index],
+            className: css.thumbVideo,
+            src: source.url,
+            muted: true,
+            preload: 'auto',
+            playsInline: true,
+            tabIndex: -1,
+            'aria-hidden': true,
+          })),
 
           h('input', {
             ref: fileInputRef,
