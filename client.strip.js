@@ -417,7 +417,9 @@ window.__ModuleLoader__.load({
 
         if (timeline === null || timeline.frameCount === 0) return null;
 
-        return h(React.Fragment, null,
+        return h('div', {
+          className: css.stripSection + (expandedSecond === null ? '' : ' ' + css.stripSectionExpanded),
+        },
           h('div', { className: css.stripHeader },
             h('span', { className: css.stripTitle },
               expandedSecond === null
@@ -436,10 +438,14 @@ window.__ModuleLoader__.load({
             h('span', { className: css.stripCount }, t('strip.current', { frame: frameIndex + 1 }))),
 
           h('div', {
-            className: css.filmstrip,
-            'data-thumb-version': String(thumbVersion),
-            'data-strip-mode': expandedSecond === null ? 'seconds' : 'frames',
+            className: css.filmstripScroll,
+            'data-filmstrip-scroll': 'true',
           },
+            h('div', {
+              className: css.filmstrip,
+              'data-thumb-version': String(thumbVersion),
+              'data-strip-mode': expandedSecond === null ? 'seconds' : 'frames',
+            },
             items.map((item) => {
               const active = expandedSecond === null
                 ? item.second === currentSecond
@@ -462,7 +468,7 @@ window.__ModuleLoader__.load({
                 onActivate: handleClick,
                 onExpand: expandedSecond === null ? handleDoubleClick : null,
               });
-            })));
+            }))));
       }
 
       return { Filmstrip, buildSecondStarts, secondOfFrame };
